@@ -1,7 +1,7 @@
 """Active checkpoint-session implementation (heavy).
 
 Contains the on-disk write path: fires checkpoints, runs restic backups
-(host + sandboxes), writes per-checkpoint sidecars. Imports the parts
+(host + sandboxes), writes per-checkpoint files. Imports the parts
 of ``inspect_ai`` that ultimately reach ``solver._task_state`` and
 ``dataset.Sample``, so this module must *not* be imported during
 initial inspect_ai package load — only at sample-run time, via the
@@ -18,10 +18,8 @@ from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timezone
 from functools import partial
 from logging import getLogger
-from pathlib import Path
 from typing import Any, TypeVar
 
-import anyio
 from pydantic import BaseModel, JsonValue, TypeAdapter
 
 from inspect_ai._util._async import tg_collect
@@ -41,7 +39,15 @@ from inspect_ai.util._sandbox.context import sandbox
 from inspect_ai.util._span import span
 from inspect_ai.util._store import Store, store_jsonable
 
-from ._layout import CheckpointDetails, SnapshotDetails, host_context, write_sidecar
+from ._host_egress import host_egress
+from ._layout import host_context
+from ._layout.sample_checkpoints_dir import (
+    _list_checkpoint_ids,
+    write_checkpoint_file,
+)
+from ._layout.schemas import Checkpoint, SnapshotDetails
+from ._layout.staging_dir import sandbox_repo_dir
+from ._logging import debug as _debug
 from ._sandbox_restic import egress_sandbox, run_sandbox_backup
 from ._triggers import CheckpointTriggerKind, create_trigger
 from .checkpointer import (
@@ -126,7 +132,9 @@ class _EnteredCheckpointer:
     ) -> None:
         self._config = config
         self._sample_checkpoints_dir = hydration.sample_checkpoints_dir
-        self._sample_working_dir = hydration.sample_working_dir
+        self._sample_staging_dir = hydration.sample_staging_dir
+        self._sample_root = hydration.sample_root
+        self._context_dir = hydration.context_dir
         self._host_restic = hydration.host_restic
         self._host_repo = hydration.host_repo
         self._restic_password = hydration.restic_password
@@ -193,14 +201,12 @@ class _EnteredCheckpointer:
             await self._close_current_span()
 
     async def _open_next_span(self) -> None:
-        # Span name matches the sidecar id this span will fire under
-        # (1-indexed, same as `ckpt-NNNNN.json`). Fresh run opens
+        # Span name matches the checkpoint id this span will fire
+        # under (1-indexed, same as `ckpt-NNNNN.json`). Fresh run opens
         # `checkpoint 1`; on resume of an attempt with M prior commits,
         # opens `checkpoint M+1`. A sample that ends without firing
         # leaves an unclosed span at whatever id was about to fire next.
-        next_id = await anyio.to_thread.run_sync(
-            _scan_next_checkpoint_id, self._sample_checkpoints_dir
-        )
+        next_id = await _scan_next_checkpoint_id(self._sample_root)
         # First-span lazy init for `_events_consumed`: capture the
         # transcript index where the about-to-open `span_begin` will land
         # so the persisted snapshot starts at the first checkpoint span.
@@ -265,16 +271,19 @@ class _EnteredCheckpointer:
     async def _fire(self, trigger: CheckpointTriggerKind) -> None:
         # Phase 3 (in progress): writes placeholder host context, runs
         # restic backups (host + sandboxes in parallel), then writes
-        # the per-checkpoint sidecar.
+        # the per-checkpoint file.
         cycle_start = time.monotonic()
-
-        # Sidecar numbering continues from any sidecars already present
-        # in the dir (incl. those FS-copied from a prior eval on resume).
-        # Scanned per-fire rather than tracked in memory so the count
-        # naturally bridges resumed runs without an explicit handoff.
-        next_checkpoint_id = await anyio.to_thread.run_sync(
-            _scan_next_checkpoint_id, self._sample_checkpoints_dir
+        _debug(
+            f"[fire] start trigger={trigger} sample_root={self._sample_root} "
+            f"staging={self._sample_staging_dir!r}"
         )
+
+        # Checkpoint file numbering continues from any checkpoint files
+        # already present in the dir (incl. those FS-copied from a prior
+        # eval on resume). Scanned per-fire rather than tracked in
+        # memory so the count naturally bridges resumed runs without an
+        # explicit handoff.
+        next_checkpoint_id = await _scan_next_checkpoint_id(self._sample_root)
 
         # Close `checkpoint N` *before* `write_host_context` so the
         # ``SpanEndEvent`` lands in this checkpoint's ``events.json`` —
@@ -286,7 +295,7 @@ class _EnteredCheckpointer:
             raise RuntimeError("Checkpointer must find sample state")
         ts = transcript()
         await self._write_host_context(
-            self._sample_working_dir,
+            self._context_dir,
             ts.events,
             ts.attachments,
             state.store,
@@ -315,12 +324,12 @@ class _EnteredCheckpointer:
             for (name, _), summary in zip(sandbox_items, summaries[1:])
         }
 
-        # Cycle duration measured up to the sidecar write — the write
-        # itself is the commit point, so its cost lands on the next
-        # cycle's clock if anywhere.
+        # Cycle duration measured up to the checkpoint file write — the
+        # write itself is the commit point, so its cost lands on the
+        # next cycle's clock if anywhere.
         duration_ms = int((time.monotonic() - cycle_start) * 1000)
 
-        sidecar = CheckpointDetails(
+        checkpoint = Checkpoint(
             checkpoint_id=next_checkpoint_id,
             trigger=trigger,
             turn=self._turn,
@@ -332,25 +341,40 @@ class _EnteredCheckpointer:
             sandboxes=sandbox_infos,
         )
 
-        await write_sidecar(
-            sample_checkpoints_dir=self._sample_checkpoints_dir,
-            sidecar=sidecar,
+        await write_checkpoint_file(
+            sample_checkpoints_dir=self._sample_root,
+            checkpoint=checkpoint,
+        )
+        _debug(
+            f"[fire] checkpoint file written: ckpt-{next_checkpoint_id:05d}.json "
+            f"at {self._sample_root} (local commit point)"
         )
 
-        # Emit the CheckpointEvent now that the sidecar is committed.
+        # Remote destination: ship the new staging-dir files (restic
+        # repo additions + checkpoint file) to the destination. The
+        # checkpoint file is shipped last in the safe order — its
+        # arrival at the destination is the remote commit point.
+        if self._sample_staging_dir is not None:
+            await host_egress(
+                staging_dir=self._sample_staging_dir,
+                destination_dir=self._sample_checkpoints_dir,
+            )
+
+        # Emit the CheckpointEvent now that the checkpoint file is
+        # committed (locally and, when remote, at the destination too).
         # By construction the event is NOT in this fire's events.json
         # (already written above); it IS captured in the next fire's
         # events.json. On resume, hydrate synthesizes the trailing
-        # event from the latest sidecar (working.md §8a).
-        transcript()._event(CheckpointEvent.from_details(sidecar))
+        # event from the latest checkpoint file (working.md §8a).
+        transcript()._event(CheckpointEvent.from_details(checkpoint))
 
-        # Sidecar is committed; open the next `checkpoint N+1` span so
-        # subsequent agent events nest under it.
+        # Checkpoint file is committed; open the next `checkpoint N+1`
+        # span so subsequent agent events nest under it.
         await self._open_next_span()
 
     async def _write_host_context(
         self,
-        sample_working_dir: str,
+        context_dir: str,
         events: Sequence[Event],
         attachments: Mapping[str, str],
         store: Store,
@@ -413,7 +437,7 @@ class _EnteredCheckpointer:
             else None
         )
         await host_context.write(
-            sample_working_dir,
+            context_dir,
             host_context.HostContext(
                 condensed_events=self._condensed_events,
                 msg_pool=self._msg_pool,
@@ -429,7 +453,7 @@ class _EnteredCheckpointer:
             self._host_restic,
             self._host_repo,
             self._restic_password,
-            self._sample_working_dir,
+            self._context_dir,
             _restic_tag(checkpoint_id),
         )
 
@@ -439,7 +463,7 @@ class _EnteredCheckpointer:
         env = sandbox(name)
         tag = _restic_tag(checkpoint_id)
         summary = await run_sandbox_backup(env, self._restic_password, paths, tag)
-        dest_repo = f"{self._sample_checkpoints_dir}/sandboxes/{name}"
+        dest_repo = sandbox_repo_dir(self._sample_root, name)
         await egress_sandbox(
             env,
             dest_repo=dest_repo,
@@ -451,26 +475,25 @@ class _EnteredCheckpointer:
         return summary
 
 
-def _scan_next_checkpoint_id(sample_checkpoints_dir: str) -> int:
-    """Return the next sidecar ordinal for this sample.
+async def _scan_next_checkpoint_id(sample_root: str) -> int:
+    """Return the next checkpoint file ordinal for this sample.
 
-    Walks the sample checkpoints dir for ``ckpt-NNNNN.json`` filenames
-    and returns ``max(N) + 1`` — or 1 if none exist yet. Used by
-    ``_fire`` so the count continues across resume without an explicit
-    handoff through ``_hydrate``.
+    Walks the sample root for ``ckpt-NNNNN.json`` filenames and returns
+    ``max(N) + 1`` — or 1 if none exist yet. Used by ``_fire`` so the
+    count continues across resume without an explicit handoff through
+    ``_hydrate``.
     """
-    sample_dir = Path(sample_checkpoints_dir)
-    if not sample_dir.is_dir():
-        return 1
-    ids = [int(p.stem.removeprefix("ckpt-")) for p in sample_dir.glob("ckpt-*.json")]
-    return (max(ids) + 1) if ids else 1
+    ids = await _list_checkpoint_ids(sample_root)
+    next_id = (max(ids) + 1) if ids else 1
+    _debug(f"[scan_next] {sample_root}: found ids={sorted(ids)} → next={next_id}")
+    return next_id
 
 
 def _restic_tag(checkpoint_id: int) -> str:
     """Format the restic ``--tag`` for a checkpoint's snapshots.
 
-    Matches the sidecar filename's ``ckpt-NNNNN`` prefix, so a tag and a
-    sidecar share the same N for the same checkpoint.
+    Matches the checkpoint file's ``ckpt-NNNNN`` prefix, so a tag and a
+    checkpoint file share the same N for the same checkpoint.
     """
     return f"ckpt-{checkpoint_id:05d}"
 

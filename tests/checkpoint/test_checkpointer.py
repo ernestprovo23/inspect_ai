@@ -79,7 +79,11 @@ def _fake_summary(checkpoint_id: int) -> ResticBackupSummary:
 @dataclass
 class _Dirs:
     checkpoints: str
-    working: str
+    """Sample checkpoints dir (destination)."""
+
+    context: str
+    """Context subdir inside the sample root — restic backup source."""
+
     events: list[object] = field(default_factory=list)
     """Live-collected transcript events from the fake transcript patched
     into `_patch_sample_runtime`. Tests that drive fires can inspect this
@@ -123,12 +127,17 @@ def _patch_sample_runtime(events: list[object]) -> Iterator[None]:
 
 @pytest.fixture
 def dirs(tmp_path: Path) -> Iterator[_Dirs]:
-    """Pre-create the two sample dirs without going through the facade."""
+    """Pre-create the per-sample dirs without going through the facade.
+
+    For local-destination tests the sample root equals the sample
+    checkpoints dir, so `context` lives under it as a peer of the
+    `restic/` subdir.
+    """
     checkpoints = tmp_path / "logs/test.checkpoints/s__0"
-    working = tmp_path / "cache/checkpoints/test/s__0"
+    context = checkpoints / "context"
     checkpoints.mkdir(parents=True)
-    working.mkdir(parents=True)
-    d = _Dirs(checkpoints=str(checkpoints), working=str(working))
+    context.mkdir(parents=True)
+    d = _Dirs(checkpoints=str(checkpoints), context=str(context))
     with _patch_sample_runtime(d.events):
         yield d
 
@@ -146,14 +155,16 @@ class _CountingCheckpointer(_EnteredCheckpointer):
         return _fake_summary(checkpoint_id)
 
 
-def _fake_hydration(
-    sample_checkpoints_dir: str, sample_working_dir: str
-) -> HydrationResult:
+def _fake_hydration(sample_checkpoints_dir: str, context_dir: str) -> HydrationResult:
+    # Local destination: sample root equals the sample checkpoints dir;
+    # no staging dir.
     return HydrationResult(
         sample_checkpoints_dir=sample_checkpoints_dir,
-        sample_working_dir=sample_working_dir,
+        sample_staging_dir=None,
+        sample_root=sample_checkpoints_dir,
+        context_dir=context_dir,
         host_restic=Path("/fake/restic"),
-        host_repo=f"{sample_checkpoints_dir}/host",
+        host_repo=f"{sample_checkpoints_dir}/restic/host",
         restic_password="test-pwd",
         host=_HostHydrationResult(),
     )
@@ -162,7 +173,7 @@ def _fake_hydration(
 def _counting(config: ResolvedCheckpointConfig, dirs: _Dirs) -> _CountingCheckpointer:
     cp = _CountingCheckpointer(
         config=config,
-        hydration=_fake_hydration(dirs.checkpoints, dirs.working),
+        hydration=_fake_hydration(dirs.checkpoints, dirs.context),
         resume_checkpoint=None,
     )
     # Policy tests drive `tick()`/`checkpoint()` without going through
@@ -303,7 +314,7 @@ async def test_checkpoint_method_fires(dirs: _Dirs) -> None:
 
 
 async def test_fire_emits_checkpoint_event(dirs: _Dirs) -> None:
-    """Successful fire appends a `CheckpointEvent` carrying the sidecar."""
+    """Successful fire appends a `CheckpointEvent` carrying the checkpoint."""
     from inspect_ai.event._checkpoint import CheckpointEvent
 
     cp = _counting(ResolvedCheckpointConfig(trigger=Manual()), dirs)
@@ -319,25 +330,28 @@ async def test_fire_emits_checkpoint_event(dirs: _Dirs) -> None:
     assert first.trigger == "manual"
     assert second.checkpoint_id == 2
     assert second.trigger == "manual"
-    # Flattened sidecar fields carry full per-repo info; with no real
+    # Flattened checkpoint fields carry full per-repo info; with no real
     # restic the stub values from `_CountingCheckpointer._backup_host`
     # round-trip.
     assert first.host.snapshot_id.startswith("fake-snap-")
 
 
 def test_synthesize_trailing_checkpoint_event(tmp_path: Path) -> None:
-    """Hydrate reconstructs the trailing CheckpointEvent from a sidecar."""
+    """Hydrate reconstructs the trailing CheckpointEvent from a checkpoint file."""
     from datetime import datetime, timezone
 
     from inspect_ai.event._checkpoint import CheckpointEvent
-    from inspect_ai.util._checkpoint._layout import CheckpointDetails, SnapshotDetails
+    from inspect_ai.util._checkpoint._layout.schemas import (
+        Checkpoint,
+        SnapshotDetails,
+    )
     from inspect_ai.util._checkpoint.hydrate import (
         _synthesize_trailing_checkpoint_event,
     )
 
     sample_dir = tmp_path / "1__0"
     sample_dir.mkdir()
-    sidecar = CheckpointDetails(
+    checkpoint = Checkpoint(
         checkpoint_id=7,
         trigger="turn",
         turn=42,
@@ -347,7 +361,7 @@ def test_synthesize_trailing_checkpoint_event(tmp_path: Path) -> None:
         host=SnapshotDetails(snapshot_id="abc", size_bytes=456, duration_ms=100),
         sandboxes={},
     )
-    (sample_dir / "ckpt-00007.json").write_text(sidecar.model_dump_json())
+    (sample_dir / "ckpt-00007.json").write_text(checkpoint.model_dump_json())
 
     event = _synthesize_trailing_checkpoint_event(str(sample_dir), 7)
 
@@ -356,9 +370,9 @@ def test_synthesize_trailing_checkpoint_event(tmp_path: Path) -> None:
     assert event.trigger == "turn"
     assert event.turn == 42
     assert event.host.snapshot_id == "abc"
-    # Synthesized event's timestamp matches the sidecar's original
+    # Synthesized event's timestamp matches the checkpoint's original
     # creation time — indistinguishable from a live emit.
-    assert event.timestamp == sidecar.created_at
+    assert event.timestamp == checkpoint.created_at
 
 
 # === Outer-facade tests =====================================================
@@ -397,7 +411,7 @@ def _patch_cache_dir(tmp_path: Path) -> Iterator[None]:
         return d
 
     with patch(
-        "inspect_ai.util._checkpoint._layout.working_dir.inspect_cache_dir",
+        "inspect_ai.util._checkpoint._layout.staging_dir.inspect_cache_dir",
         side_effect=fake_cache_dir,
     ):
         yield
@@ -471,7 +485,7 @@ async def test_checkpointer_raises_without_active_sample() -> None:
 # === e2e: outer facade through to disk =====================================
 
 
-async def test_fire_writes_sample_json_and_sidecars(
+async def test_fire_writes_restic_config_and_checkpoint_files(
     active_sample: _FakeActiveSample, tmp_path: Path
 ) -> None:
     """Driving the outer checkpointer end-to-end writes destination + working tree."""
@@ -501,16 +515,18 @@ async def test_fire_writes_sample_json_and_sidecars(
     log = Path(active_sample.log_location)
     eval_dir = log.parent / f"{log.stem}.checkpoints"
     sample_dir = eval_dir / "s7__2"
-    assert (sample_dir / "sample.json").is_file()
-    sidecars = sorted(p.name for p in sample_dir.glob("ckpt-*.json"))
-    assert sidecars == ["ckpt-00001.json", "ckpt-00002.json"]
+    assert (sample_dir / "restic" / "restic-config.json").is_file()
+    checkpoint_files = sorted(p.name for p in sample_dir.glob("ckpt-*.json"))
+    assert checkpoint_files == ["ckpt-00001.json", "ckpt-00002.json"]
 
-    sample_working = tmp_path / "cache/checkpoints/test/s7__2"
-    assert sample_working.is_dir()
-    assert (sample_working / "events.json").is_file()
-    assert (sample_working / "events_data.json").is_file()
-    assert (sample_working / "attachments.json").is_file()
-    assert (sample_working / "store.json").is_file()
+    # Local destination → sample root is the sample checkpoints dir
+    # itself; the `context/` subdir holds host context files.
+    context = sample_dir / "context"
+    assert context.is_dir()
+    assert (context / "events.json").is_file()
+    assert (context / "events_data.json").is_file()
+    assert (context / "attachments.json").is_file()
+    assert (context / "store.json").is_file()
 
 
 # === _write_host_context: condensed events round-trip =======================
@@ -719,20 +735,21 @@ async def test_setup_aenter_defers_io_setup(tmp_path: Path) -> None:
 
     fake_env = MagicMock()
     fake_sample_state = MagicMock(restic_password="pwd")
+    sample_ckpt_path = str(tmp_path / "ckpts" / "s__0")
 
     with (
         patch(
             "inspect_ai.util._checkpoint.hydrate.ensure_sample_checkpoints_dir",
-            new=AsyncMock(return_value=str(tmp_path / "ckpts" / "s__0")),
+            new=AsyncMock(return_value=sample_ckpt_path),
         ) as ensure_ckpt,
         patch(
-            "inspect_ai.util._checkpoint.hydrate.ensure_sample_working_dir",
-            new=AsyncMock(return_value=str(tmp_path / "work" / "s__0")),
-        ) as ensure_work,
+            "inspect_ai.util._checkpoint.hydrate.ensure_context_dir",
+            new=AsyncMock(return_value=f"{sample_ckpt_path}/context"),
+        ) as ensure_ctx,
         patch(
-            "inspect_ai.util._checkpoint.hydrate.ensure_sample_json",
+            "inspect_ai.util._checkpoint.hydrate.ensure_restic_config",
             new=AsyncMock(return_value=fake_sample_state),
-        ) as ensure_sample_json_mock,
+        ) as ensure_restic_config_mock,
         patch(
             "inspect_ai.util._checkpoint.hydrate.resolve_restic",
             new=AsyncMock(return_value=Path("/fake/restic")),
@@ -757,8 +774,8 @@ async def test_setup_aenter_defers_io_setup(tmp_path: Path) -> None:
         # construction did NOT touch any I/O
         for m in (
             ensure_ckpt,
-            ensure_work,
-            ensure_sample_json_mock,
+            ensure_ctx,
+            ensure_restic_config_mock,
             resolve,
             init_host,
             get_sandbox,
@@ -771,8 +788,8 @@ async def test_setup_aenter_defers_io_setup(tmp_path: Path) -> None:
             assert isinstance(cp, _EnteredCheckpointer)
             # __aenter__ ran every I/O step exactly once
             ensure_ckpt.assert_awaited_once()
-            ensure_work.assert_awaited_once()
-            ensure_sample_json_mock.assert_awaited_once()
+            ensure_ctx.assert_awaited_once()
+            ensure_restic_config_mock.assert_awaited_once()
             resolve.assert_awaited_once()
             init_host.assert_awaited_once()
             get_sandbox.assert_called_once_with("web")
